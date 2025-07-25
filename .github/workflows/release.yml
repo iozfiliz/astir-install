@@ -1,0 +1,292 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+      source_repo:
+        description: 'Source repository (e.g., user/repo)'
+        required: true
+        type: string
+        default: 'iozfiliz/desktop-orchestrator'
+      source_ref:
+        description: 'Source branch/tag (e.g., main, v1.0.0)'
+        required: true
+        type: string
+        default: 'main'
+
+jobs:
+  build:
+    name: Build Multi-Architecture Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+          - arch: armv7
+            goarch: arm
+            goarm: "7"
+          - arch: armv6
+            goarch: arm
+            goarm: "6"
+    
+    steps:
+    - name: Checkout astir-install repository
+      uses: actions/checkout@v4
+    
+    - name: Checkout source repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.source_repo }}
+        ref: ${{ github.event.inputs.source_ref }}
+        path: source
+        token: ${{ secrets.SOURCE_REPO_TOKEN }}
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+    
+    - name: Build binary
+      env:
+        GOOS: linux
+        GOARCH: ${{ matrix.goarch }}
+        GOARM: ${{ matrix.goarm }}
+        CGO_ENABLED: 0
+      run: |
+        cd source/client
+        
+        # Set version in build
+        VERSION="${{ github.event.inputs.version }}"
+        LDFLAGS="-X main.version=${VERSION} -s -w"
+        
+        # Build binary
+        go build -ldflags "${LDFLAGS}" -o "../../astir-linux-${{ matrix.arch }}" ./cmd/client
+        
+        # Verify binary
+        file "../../astir-linux-${{ matrix.arch }}"
+        ls -la "../../astir-linux-${{ matrix.arch }}"
+    
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: astir-linux-${{ matrix.arch }}
+        path: astir-linux-${{ matrix.arch }}
+        retention-days: 1
+
+  package:
+    name: Create Debian Packages
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            deb_arch: amd64
+          - arch: arm64
+            deb_arch: arm64
+          - arch: armv7
+            deb_arch: armhf
+          - arch: armv6
+            deb_arch: armel
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Download binary artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: astir-linux-${{ matrix.arch }}
+    
+    - name: Create Debian package
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        CLEAN_VERSION="${VERSION#v}"  # Remove 'v' prefix
+        BINARY_NAME="astir-linux-${{ matrix.arch }}"
+        PACKAGE_NAME="astir_${CLEAN_VERSION}_${{ matrix.deb_arch }}.deb"
+        
+        # Create package directory structure
+        mkdir -p "package/usr/local/bin"
+        mkdir -p "package/DEBIAN"
+        
+        # Copy binary
+        cp "${BINARY_NAME}" "package/usr/local/bin/astir"
+        chmod 755 "package/usr/local/bin/astir"
+        
+        # Create control file
+        cat > "package/DEBIAN/control" << EOF
+        Package: astir
+        Version: ${CLEAN_VERSION}
+        Architecture: ${{ matrix.deb_arch }}
+        Maintainer: Astir Team <info@astir.dev>
+        Depends: docker.io | docker-ce
+        Description: Astir Desktop Client
+         Desktop-as-a-Service client for accessing cloud-based development environments.
+         Provides secure, Solana wallet-authenticated access to containerized desktop
+         sessions with full SSH access and development tools.
+        Homepage: https://github.com/iozfiliz/astir-install
+        EOF
+        
+        # Create postinst script
+        cat > "package/DEBIAN/postinst" << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        # Create user directories
+        if [ "$1" = "configure" ]; then
+            # This runs as root, but we want user dirs to be created when user runs astir
+            echo "Astir installed successfully!"
+            echo "Run 'astir' to get started."
+        fi
+        
+        exit 0
+        EOF
+        chmod 755 "package/DEBIAN/postinst"
+        
+        # Create prerm script
+        cat > "package/DEBIAN/prerm" << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        # Stop any running astir processes
+        if [ "$1" = "remove" ]; then
+            pkill -f "/usr/local/bin/astir" || true
+        fi
+        
+        exit 0
+        EOF
+        chmod 755 "package/DEBIAN/prerm"
+        
+        # Build package
+        dpkg-deb --build package "${PACKAGE_NAME}"
+        
+        # Verify package
+        dpkg-deb --info "${PACKAGE_NAME}"
+        ls -la "${PACKAGE_NAME}"
+    
+    - name: Upload package artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: astir_${{ matrix.deb_arch }}.deb
+        path: astir_*.deb
+        retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, package]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Prepare release assets
+      run: |
+        # Create release directory
+        mkdir -p release
+        
+        # Move binaries
+        mv astir-linux-amd64/astir-linux-amd64 release/
+        mv astir-linux-arm64/astir-linux-arm64 release/
+        mv astir-linux-armv7/astir-linux-armv7 release/
+        mv astir-linux-armv6/astir-linux-armv6 release/
+        
+        # Move packages (find them in the artifact directories)
+        find . -name "*.deb" -exec mv {} release/ \;
+        
+        # Create checksums
+        cd release
+        sha256sum * > checksums.txt
+        
+        # List all files
+        ls -la
+        cat checksums.txt
+    
+    - name: Generate release notes
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        
+        cat > release_notes.md << EOF
+        # Astir Desktop Client ${VERSION}
+        
+        ## Installation
+        
+        ### Universal Installer (Recommended)
+        \`\`\`bash
+        curl -sSL https://raw.githubusercontent.com/iozfiliz/astir-install/main/install.sh | bash
+        \`\`\`
+        
+        ### Debian Package
+        \`\`\`bash
+        # AMD64
+        wget https://github.com/iozfiliz/astir-install/releases/download/${VERSION}/astir_$(echo ${VERSION} | sed 's/v//')_amd64.deb
+        sudo dpkg -i astir_*.deb
+        
+        # ARM64
+        wget https://github.com/iozfiliz/astir-install/releases/download/${VERSION}/astir_$(echo ${VERSION} | sed 's/v//')_arm64.deb
+        sudo dpkg -i astir_*.deb
+        \`\`\`
+        
+        ### Manual Installation
+        \`\`\`bash
+        # Download for your architecture
+        wget https://github.com/iozfiliz/astir-install/releases/download/${VERSION}/astir-linux-amd64
+        chmod +x astir-linux-amd64
+        sudo mv astir-linux-amd64 /usr/local/bin/astir
+        \`\`\`
+        
+        ## Supported Architectures
+        
+        - **Linux AMD64** (Intel/AMD 64-bit) - \`astir-linux-amd64\`
+        - **Linux ARM64** (64-bit ARM) - \`astir-linux-arm64\`
+        - **Linux ARMv7** (32-bit ARM) - \`astir-linux-armv7\`
+        - **Linux ARMv6** (Raspberry Pi Zero) - \`astir-linux-armv6\`
+        
+        ## What's New
+        
+        This release includes the latest features and improvements from the main repository.
+        
+        ## Verification
+        
+        All binaries and packages can be verified using the provided checksums:
+        
+        \`\`\`bash
+        # Download checksums
+        wget https://github.com/iozfiliz/astir-install/releases/download/${VERSION}/checksums.txt
+        
+        # Verify your download
+        sha256sum -c checksums.txt
+        \`\`\`
+        
+        ---
+        
+        🚀 **Generated with GitHub Actions** from source repository: \`${{ github.event.inputs.source_repo }}\` @ \`${{ github.event.inputs.source_ref }}\`
+        EOF
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.event.inputs.version }}
+        name: Astir Desktop Client ${{ github.event.inputs.version }}
+        body_path: release_notes.md
+        files: |
+          release/astir-linux-amd64
+          release/astir-linux-arm64
+          release/astir-linux-armv7
+          release/astir-linux-armv6
+          release/*.deb
+          release/checksums.txt
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
