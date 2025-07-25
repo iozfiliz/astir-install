@@ -195,22 +195,41 @@ jobs:
         # Create release directory
         mkdir -p release
         
-        # Move binaries
-        mv astir-linux-amd64/astir-linux-amd64 release/
-        mv astir-linux-arm64/astir-linux-arm64 release/
-        mv astir-linux-armv7/astir-linux-armv7 release/
-        mv astir-linux-armv6/astir-linux-armv6 release/
+        # Show current directory structure for debugging
+        echo "Current directory structure:"
+        find . -type f -name "*astir*" -o -name "*.deb" | head -20
         
-        # Move packages (find them in the artifact directories)
-        find . -name "*.deb" -exec mv {} release/ \;
+        # Move binaries (they should be in artifact subdirectories)
+        if [ -f "astir-linux-amd64/astir-linux-amd64" ]; then
+          mv astir-linux-amd64/astir-linux-amd64 release/
+        fi
+        if [ -f "astir-linux-arm64/astir-linux-arm64" ]; then
+          mv astir-linux-arm64/astir-linux-arm64 release/
+        fi
+        if [ -f "astir-linux-armv7/astir-linux-armv7" ]; then
+          mv astir-linux-armv7/astir-linux-armv7 release/
+        fi
+        if [ -f "astir-linux-armv6/astir-linux-armv6" ]; then
+          mv astir-linux-armv6/astir-linux-armv6 release/
+        fi
+        
+        # Move packages (find them and avoid duplicates)
+        find . -name "*.deb" -not -path "./release/*" -exec cp {} release/ \;
         
         # Create checksums
         cd release
-        sha256sum * > checksums.txt
-        
-        # List all files
-        ls -la
-        cat checksums.txt
+        if [ -n "$(ls -A .)" ]; then
+          sha256sum * > checksums.txt
+          
+          # List all files
+          echo "Release files:"
+          ls -la
+          echo "Checksums:"
+          cat checksums.txt
+        else
+          echo "ERROR: No files found in release directory!"
+          exit 1
+        fi
     
     - name: Generate release notes
       run: |
